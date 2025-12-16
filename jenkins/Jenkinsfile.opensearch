@@ -1,0 +1,141 @@
+pipeline {
+  agent any
+  options { timestamps() }
+
+  parameters {
+    string(name: 'WP_VM_IPS', defaultValue: '34.118.101.104,34.116.165.84', description: 'Comma-separated WordPress VM IPs/hosts')
+    string(name: 'OPENSEARCH_HOST', defaultValue: '34.118.0.33', description: 'OpenSearch host/IP')
+    string(name: 'OPENSEARCH_PORT', defaultValue: '9200', description: 'OpenSearch port (usually 9200)')
+    booleanParam(name: 'USE_BASIC_AUTH', defaultValue: true, description: 'Use basic auth for OpenSearch output')
+    string(name: 'INDEX_PREFIX', defaultValue: 'nginx-wp', description: 'Index prefix, e.g. nginx-wp -> nginx-wp-YYYY.MM.DD')
+  }
+
+  stages {
+    stage('Install + configure Filebeat on WP VMs') {
+      steps {
+        withCredentials([
+          sshUserPrivateKey(credentialsId: 'gcp-ssh-key', keyFileVariable: 'SSH_KEY', usernameVariable: 'SSH_USER'),
+          string(credentialsId: 'opensearch_user', variable: 'OS_USER'),
+          string(credentialsId: 'opensearch_pass', variable: 'OS_PASS')
+        ]) {
+          sh """#!/bin/bash
+set -euo pipefail
+
+WP_IPS_RAW="${params.WP_VM_IPS}"
+OPENSEARCH_HOST="${params.OPENSEARCH_HOST}"
+OPENSEARCH_PORT="${params.OPENSEARCH_PORT}"
+USE_BASIC_AUTH="${params.USE_BASIC_AUTH}"
+INDEX_PREFIX="${params.INDEX_PREFIX}"
+
+IFS=',' read -ra WP_IPS <<< "$WP_IPS_RAW"
+
+echo "OpenSearch target: http://${OPENSEARCH_HOST}:${OPENSEARCH_PORT}"
+echo "USE_BASIC_AUTH: ${USE_BASIC_AUTH}"
+echo "Index prefix: ${INDEX_PREFIX}"
+echo "WordPress VMs: ${WP_IPS_RAW}"
+
+for ip in "${WP_IPS[@]}"; do
+  ip="$(echo "$ip" | xargs)"
+  [ -z "$ip" ] && continue
+
+  echo
+  echo "==== [$ip] Installing and configuring Filebeat ===="
+
+  ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$SSH_USER@$ip" bash -s -- \\
+    "$OPENSEARCH_HOST" "$OPENSEARCH_PORT" "$USE_BASIC_AUTH" "$INDEX_PREFIX" "$OS_USER" "$OS_PASS" <<'REMOTE'
+set -euo pipefail
+
+OPENSEARCH_HOST="$1"
+OPENSEARCH_PORT="$2"
+USE_BASIC_AUTH="$3"
+INDEX_PREFIX="$4"
+OS_USER="$5"
+OS_PASS="$6"
+
+echo "Target OpenSearch: http://${OPENSEARCH_HOST}:${OPENSEARCH_PORT}"
+echo "Index prefix: ${INDEX_PREFIX}"
+
+# Requirements: passwordless sudo (or this will prompt and fail)
+sudo -n true 2>/dev/null || { echo "ERROR: sudo requires a password on this VM. Configure passwordless sudo for this user."; exit 1; }
+
+# Install Filebeat (Elastic package). It can ship to OpenSearch via Elasticsearch-compatible output in many setups.
+# If your OpenSearch requires custom TLS or has strict compatibility, you may need extra tweaks.
+if ! command -v filebeat >/dev/null 2>&1; then
+  echo "Installing Filebeat..."
+  sudo apt-get update -y
+  sudo apt-get install -y curl gnupg apt-transport-https
+
+  curl -fsSL https://artifacts.elastic.co/GPG-KEY-elasticsearch | sudo gpg --dearmor -o /usr/share/keyrings/elastic-keyring.gpg
+  echo "deb [signed-by=/usr/share/keyrings/elastic-keyring.gpg] https://artifacts.elastic.co/packages/8.x/apt stable main" | \\
+    sudo tee /etc/apt/sources.list.d/elastic-8.x.list >/dev/null
+
+  sudo apt-get update -y
+  sudo apt-get install -y filebeat
+fi
+
+echo "Configuring Filebeat for nginx logs..."
+
+# Write Filebeat config (nginx access/error logs on Ubuntu)
+sudo tee /etc/filebeat/filebeat.yml >/dev/null <<EOF
+filebeat.inputs:
+  - type: filestream
+    id: nginx-access
+    enabled: true
+    paths:
+      - /var/log/nginx/access.log
+    fields:
+      service: wordpress
+      log_type: nginx_access
+
+  - type: filestream
+    id: nginx-error
+    enabled: true
+    paths:
+      - /var/log/nginx/error.log
+    fields:
+      service: wordpress
+      log_type: nginx_error
+
+setup.ilm.enabled: false
+
+output.elasticsearch:
+  hosts: ["http://${OPENSEARCH_HOST}:${OPENSEARCH_PORT}"]
+  index: "${INDEX_PREFIX}-%{+yyyy.MM.dd}"
+EOF
+
+# Add basic auth if requested (kept simple: username/password)
+if [ "$USE_BASIC_AUTH" = "true" ]; then
+  if [ -z "$OS_USER" ] || [ -z "$OS_PASS" ]; then
+    echo "ERROR: USE_BASIC_AUTH=true but opensearch_user/opensearch_pass not provided in Jenkins credentials."
+    exit 1
+  fi
+  sudo tee -a /etc/filebeat/filebeat.yml >/dev/null <<EOF
+
+  username: "${OS_USER}"
+  password: "${OS_PASS}"
+EOF
+fi
+
+# Ensure nginx logs exist (nginx should already be installed on WP VMs)
+sudo test -f /var/log/nginx/access.log || echo "WARN: /var/log/nginx/access.log not found (nginx may not have served traffic yet)."
+sudo test -f /var/log/nginx/error.log  || echo "WARN: /var/log/nginx/error.log not found."
+
+sudo systemctl enable filebeat
+sudo systemctl restart filebeat
+
+echo "Filebeat status:"
+sudo systemctl status filebeat --no-pager | head -n 20 || true
+
+echo "Done."
+REMOTE
+
+done
+
+echo
+echo "All WP VMs processed."
+"""
+        }
+      }
+    }
+  }
+}

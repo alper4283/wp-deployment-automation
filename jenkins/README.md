@@ -1,7 +1,7 @@
 # Jenkins Pipelines
 
 This directory documents the Jenkins pipelines used in the WordPress deployment automation project.
-The pipelines handle theme deployment, automated testing, and backup operations.
+The pipelines handle theme deployment, automated testing, backups, and log shipping.
 
 All pipelines are defined as Jenkinsfiles and are intended to be created as Jenkins Pipeline jobs.
 
@@ -120,11 +120,65 @@ In a production system, permissions should be tightened.
 
 ---
 
+## Pipeline: opensearch-nginx-shipper
+
+**Purpose**  
+Installs and configures log shipping on WordPress VMs to forward nginx access and error logs
+to an existing OpenSearch instance.
+
+This pipeline focuses on **log shipping only**.
+OpenSearch installation, dashboards, and index management are handled manually.
+
+**Trigger**
+- Manual (on demand)
+
+**Flow**
+1. Connects to each specified WordPress VM
+2. Installs Filebeat if not present
+3. Configures Filebeat to collect nginx access and error logs
+4. Forwards logs to the specified OpenSearch endpoint
+5. Enables and starts Filebeat as a system service
+
+**Parameters**
+- `WP_VM_IPS` – Comma-separated list of WordPress VM IPs/hosts
+- `OPENSEARCH_HOST` – OpenSearch host/IP
+- `OPENSEARCH_PORT` – OpenSearch port (default: 9200)
+- `USE_BASIC_AUTH` – Whether to use basic authentication
+- `INDEX_PREFIX` – Index prefix for nginx logs (e.g. nginx-wp)
+
+**Required Jenkins credentials**
+- `gcp-ssh-key`  
+  Type: SSH Username with private key  
+  Used to SSH into WordPress VMs
+- `opensearch_user` (optional)  
+  Type: Secret text  
+  Used if basic authentication is enabled
+- `opensearch_pass` (optional)  
+  Type: Secret text  
+  Used if basic authentication is enabled
+
+**Requirements**
+- WordPress VMs:
+  - nginx installed and logging to `/var/log/nginx/`
+  - Passwordless sudo
+  - Internet access to install Filebeat packages
+- OpenSearch:
+  - Accessible from WordPress VMs
+  - Elasticsearch-compatible HTTP endpoint
+
+**Note**
+TLS, authentication, and advanced index management can be customized depending on the OpenSearch setup.
+This pipeline provides a simple, working baseline for centralized log collection.
+
+---
+
 ## Manual / one-time setup steps
 
 - Configure Jenkins SSH credentials (`gcp-ssh-key`)
 - Configure GitHub webhook for the theme repository
+- Configure OpenSearch credentials (if authentication is enabled)
 - Ensure VM firewall rules allow SSH access from Jenkins
+- Ensure WordPress VMs can reach the OpenSearch endpoint
 
 ---
 
@@ -132,5 +186,7 @@ In a production system, permissions should be tightened.
 These pipelines are part of a larger WordPress automation project that includes:
 - Infrastructure provisioning (Pulumi)
 - Configuration management (Ansible)
-- Monitoring and logging
+- CI/CD pipelines
+- Monitoring and centralized logging
+- Backup automation
 - Performance testing and evaluation
