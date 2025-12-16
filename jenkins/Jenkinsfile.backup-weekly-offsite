@@ -1,0 +1,113 @@
+pipeline {
+    agent any
+
+    environment {
+        TEST_VM_IP   = '34.118.101.104'
+        PROD_VM_IP   = '34.116.165.84'
+        BACKUP_VM_IP = '34.116.128.184'
+
+        REMOTE_BACKUP_ROOT = '/var/backups/wp'
+        BACKUP_ROOT        = '/srv/wp-offsite-backups'
+    }
+
+    // Weekly on Sunday around 04:00 (Jenkins server time).
+    triggers {
+        cron('H 4 * * 0')
+    }
+
+    stages {
+        stage('Pull TEST and PROD backups to backup VM') {
+            steps {
+                withCredentials([
+                    sshUserPrivateKey(
+                        credentialsId: 'gcp-ssh-key',
+                        keyFileVariable: 'SSH_KEY',
+                        usernameVariable: 'SSH_USER'
+                    )
+                ]) {
+                    sh """#!/bin/bash
+set -euo pipefail
+
+echo "==== Starting offsite backup ===="
+
+LOCAL_TMP="\${WORKSPACE}/offsite_tmp"
+rm -rf "\$LOCAL_TMP"
+mkdir -p "\$LOCAL_TMP"
+
+pull_latest() {
+  local TAG="\$1"       # "test" or "prod"
+  local SRC_VM="\$2"    # WP VM IP
+  local DEST_DIR="\$3"  # target dir on backup VM
+
+  echo "---- Processing \$TAG (\$SRC_VM) ----"
+
+  # Find newest DB backup on source VM
+  local LATEST_DB
+  LATEST_DB=\$(ssh -i "\$SSH_KEY" -o StrictHostKeyChecking=no "\$SSH_USER@\${SRC_VM}" \
+    "ls -1t ${REMOTE_BACKUP_ROOT}/\$TAG/db-*.sql 2>/dev/null | head -n 1" || true)
+
+  # Find newest site backup on source VM
+  local LATEST_SITE
+  LATEST_SITE=\$(ssh -i "\$SSH_KEY" -o StrictHostKeyChecking=no "\$SSH_USER@\${SRC_VM}" \
+    "ls -1t ${REMOTE_BACKUP_ROOT}/\$TAG/site-*.tar.gz 2>/dev/null | head -n 1" || true)
+
+  if [[ -z "\$LATEST_DB" && -z "\$LATEST_SITE" ]]; then
+    echo "No backups found for \$TAG on \$SRC_VM; skipping."
+    return
+  fi
+
+  # Ensure target dir exists on backup VM
+  ssh -i "\$SSH_KEY" -o StrictHostKeyChecking=no "\$SSH_USER@${BACKUP_VM_IP}" \
+    "sudo mkdir -p '\$DEST_DIR' && sudo chmod 777 '\$DEST_DIR'"
+
+  # Local temp dir for this tag
+  local LOCAL_TAG_DIR="\$LOCAL_TMP/\$TAG"
+  mkdir -p "\$LOCAL_TAG_DIR"
+
+  # 1) Copy DB: SRC_VM -> Jenkins -> backup VM
+  if [[ -n "\$LATEST_DB" ]]; then
+    local DB_BASENAME
+    DB_BASENAME=\$(basename "\$LATEST_DB")
+    echo "Copying DB from \$SRC_VM: \$LATEST_DB"
+    scp -i "\$SSH_KEY" -o StrictHostKeyChecking=no \
+      "\$SSH_USER@\${SRC_VM}:\$LATEST_DB" "\$LOCAL_TAG_DIR/\$DB_BASENAME"
+
+    echo "Sending DB to backup VM: ${BACKUP_VM_IP}:\$DEST_DIR/\$DB_BASENAME"
+    scp -i "\$SSH_KEY" -o StrictHostKeyChecking=no \
+      "\$LOCAL_TAG_DIR/\$DB_BASENAME" \
+      "\$SSH_USER@${BACKUP_VM_IP}:\$DEST_DIR/"
+  fi
+
+  # 2) Copy site: SRC_VM -> Jenkins -> backup VM
+  if [[ -n "\$LATEST_SITE" ]]; then
+    local SITE_BASENAME
+    SITE_BASENAME=\$(basename "\$LATEST_SITE")
+    echo "Copying site from \$SRC_VM: \$LATEST_SITE"
+    scp -i "\$SSH_KEY" -o StrictHostKeyChecking=no \
+      "\$SSH_USER@\${SRC_VM}:\$LATEST_SITE" "\$LOCAL_TAG_DIR/\$SITE_BASENAME"
+
+    echo "Sending site to backup VM: ${BACKUP_VM_IP}:\$DEST_DIR/\$SITE_BASENAME"
+    scp -i "\$SSH_KEY" -o StrictHostKeyChecking=no \
+      "\$LOCAL_TAG_DIR/\$SITE_BASENAME" \
+      "\$SSH_USER@${BACKUP_VM_IP}:\$DEST_DIR/"
+  fi
+
+  echo "Local temp for \$TAG (will be cleaned):"
+  ls -lh "\$LOCAL_TAG_DIR" || true
+  echo "Completed \$TAG."
+  echo
+}
+
+pull_latest "test" "\${TEST_VM_IP}" "${BACKUP_ROOT}/test"
+pull_latest "prod" "\${PROD_VM_IP}" "${BACKUP_ROOT}/prod"
+
+echo "Cleaning up local temp..."
+rm -rf "\$LOCAL_TMP"
+
+echo "==== Offsite backup complete ===="
+"""
+                }
+            }
+        }
+    }
+}

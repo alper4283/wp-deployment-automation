@@ -1,0 +1,100 @@
+pipeline {
+    agent any
+
+    parameters {
+        string(
+            name: 'VM_IP',
+            defaultValue: '34.118.101.104', // test VM by default
+            description: 'Target WordPress VM IP/host to back up'
+        )
+        string(
+            name: 'SITE_TAG',
+            defaultValue: 'test',           // "test" or "prod"
+            description: 'Label used in backup path (e.g. test / prod)'
+        )
+    }
+
+    environment {
+        WP_DIR      = '/var/www/html'
+        BACKUP_DIR  = '/var/backups/wp'
+        THEME_NAME  = 'argon'  
+    }
+
+     triggers {
+         cron('H 3 * * *')  // around 03:00 every day
+     }
+
+    stages {
+        stage('Backup WordPress on target VM') {
+            steps {
+                withCredentials([
+                    sshUserPrivateKey(
+                        credentialsId: 'gcp-ssh-key',
+                        keyFileVariable: 'SSH_KEY',
+                        usernameVariable: 'SSH_USER'
+                    )
+                ]) {
+                    sh """#!/bin/bash
+set -euo pipefail
+
+echo "Starting backup on \${SITE_TAG} VM (\${VM_IP})"
+
+ssh -i "\$SSH_KEY" -o StrictHostKeyChecking=no "\$SSH_USER@\${VM_IP}" bash -c '
+  set -euo pipefail
+
+  WP_DIR="${WP_DIR}"
+  BACKUP_ROOT="${BACKUP_DIR}"
+  SITE_TAG="${SITE_TAG}"
+
+  TS=\$(date +%Y%m%d-%H%M%S)
+  HOST_BACKUP_DIR="\${BACKUP_ROOT}/\${SITE_TAG}"
+
+  echo "Using backup dir: \${HOST_BACKUP_DIR}"
+
+  # Ensure backup dir exists
+  sudo mkdir -p "\${HOST_BACKUP_DIR}"
+  sudo chown "\$USER":"\$USER" "\${HOST_BACKUP_DIR}" || true
+
+  cd "\${WP_DIR}"
+
+  # Ensure WP-CLI exists (same logic as your deploy pipeline)
+  if ! command -v wp >/dev/null 2>&1; then
+      echo "WP-CLI not found, installing..."
+      curl -sS -o /tmp/wp-cli.phar https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
+      php /tmp/wp-cli.phar --info >/dev/null 2>&1 || { echo "PHP not working for WP-CLI"; exit 1; }
+      sudo chmod +x /tmp/wp-cli.phar
+      sudo mv /tmp/wp-cli.phar /usr/local/bin/wp
+  fi
+
+  echo "WP-CLI version:"
+  wp --version
+
+  # 1) DB export via WP-CLI (uses DB config from wp-config.php)
+  DB_FILE="\${HOST_BACKUP_DIR}/db-\${TS}.sql"
+  echo "Exporting database to \${DB_FILE}"
+  wp db export "\${DB_FILE}"
+
+  # 2) Files archive (HTML + wp-content etc.)
+  SITE_FILE="\${HOST_BACKUP_DIR}/site-\${TS}.tar.gz"
+  echo "Creating site archive \${SITE_FILE}"
+  sudo tar czf "\${SITE_FILE}" -C "\${WP_DIR}" .
+
+  echo "Backup created:"
+  ls -lh "\${HOST_BACKUP_DIR}"/db-\${TS}.sql "\${HOST_BACKUP_DIR}"/site-\${TS}.tar.gz
+
+  # 3) Retention: keep latest 7 of each, delete older ones
+  echo "Applying retention (keep last 7 DB dumps and 7 site archives)..."
+  sudo ls -1t "\${HOST_BACKUP_DIR}"/db-*.sql       2>/dev/null | tail -n +8 | xargs -r sudo rm -f --
+  sudo ls -1t "\${HOST_BACKUP_DIR}"/site-*.tar.gz  2>/dev/null | tail -n +8 | xargs -r sudo rm -f --
+
+  echo "Remaining backups in \${HOST_BACKUP_DIR}:"
+  ls -1 "\${HOST_BACKUP_DIR}"
+'
+
+echo "Backup finished for \${SITE_TAG} (\${VM_IP})"
+"""
+                }
+            }
+        }
+    }
+}

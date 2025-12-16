@@ -1,0 +1,191 @@
+pipeline {
+    agent any
+
+    parameters {
+        string(
+            name: 'TEST_VM_IP',
+            defaultValue: '34.118.101.104',
+            description: 'Test WordPress VM IP/host (deploy + run e2e tests here)'
+        )
+        string(
+            name: 'PROD_VM_IP',
+            defaultValue: '34.116.165.84',
+            description: 'Main/production WordPress VM IP/host'
+        )
+        string(
+            name: 'THEME_NAME',
+            defaultValue: 'argon',
+            description: 'Theme folder/slug under wp-content/themes'
+        )
+    }
+
+    environment {
+        REPO_URL = 'https://github.com/alper4283/argon-theme.git'
+        BRANCH   = 'master'
+    }
+
+    triggers {
+        githubPush()
+    }
+
+    stages {
+        stage('Checkout theme') {
+            steps {
+                deleteDir()
+                git url: "${REPO_URL}", branch: "${BRANCH}"
+            }
+        }
+
+        // --------------------- TEST VM --------------------- //
+
+        stage('Deploy to TEST VM') {
+            steps {
+                withCredentials([
+                    sshUserPrivateKey(
+                        credentialsId: 'gcp-ssh-key',
+                        keyFileVariable: 'SSH_KEY',
+                        usernameVariable: 'SSH_USER'
+                    )
+                ]) {
+                    sh '''#!/bin/bash
+set -e
+
+echo "Syncing theme to ${SSH_USER}@${TEST_VM_IP}:/var/www/html/wp-content/themes/${THEME_NAME}"
+
+rsync -az --delete \
+  --exclude='.git' \
+  --exclude='.github' \
+  --exclude='node_modules' \
+  -e "ssh -i \"$SSH_KEY\" -o StrictHostKeyChecking=no" \
+  --rsync-path="sudo rsync" \
+  ./ "${SSH_USER}@${TEST_VM_IP}:/var/www/html/wp-content/themes/${THEME_NAME}"
+'''
+                }
+            }
+        }
+
+        stage('Install WP-CLI on TEST & activate theme') {
+            steps {
+                withCredentials([
+                    sshUserPrivateKey(
+                        credentialsId: 'gcp-ssh-key',
+                        keyFileVariable: 'SSH_KEY',
+                        usernameVariable: 'SSH_USER'
+                    )
+                ]) {
+                    sh """#!/bin/bash
+set -e
+
+ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$SSH_USER@$TEST_VM_IP" bash -c '
+  set -e
+  cd /var/www/html
+
+  # Install WP-CLI if not present
+  if ! command -v wp >/dev/null 2>&1; then
+      echo "WP-CLI not found on TEST, installing..."
+      curl -sS -o /tmp/wp-cli.phar https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
+      php /tmp/wp-cli.phar --info >/dev/null 2>&1 || { echo "PHP not working for WP-CLI"; exit 1; }
+      sudo chmod +x /tmp/wp-cli.phar
+      sudo mv /tmp/wp-cli.phar /usr/local/bin/wp
+  fi
+
+  echo "WP-CLI version (TEST):"
+  wp --version
+
+  echo "Activating theme on TEST: ${THEME_NAME}"
+  wp theme activate "${THEME_NAME}" || true
+'
+"""
+                }
+            }
+        }
+
+        stage('Run E2E tests on TEST VM') {
+            steps {
+                sh '''#!/bin/bash
+set -e
+
+# Install JS deps for tests
+if [ -f package-lock.json ]; then
+  npm ci
+else
+  npm install
+fi
+
+# Ensure Playwright browser is available
+npx playwright install chromium
+
+# Run Cucumber + Playwright tests against TEST VM
+export TEST_WP_URL="http://${TEST_VM_IP}/"
+echo "Running e2e tests against ${TEST_WP_URL}"
+
+npm run test:e2e
+'''
+            }
+        }
+
+        // --------------------- PROD VM --------------------- //
+
+        stage('Deploy to PROD VM') {
+            steps {
+                withCredentials([
+                    sshUserPrivateKey(
+                        credentialsId: 'gcp-ssh-key',
+                        keyFileVariable: 'SSH_KEY',
+                        usernameVariable: 'SSH_USER'
+                    )
+                ]) {
+                    sh '''#!/bin/bash
+set -e
+
+echo "Syncing theme to ${SSH_USER}@${PROD_VM_IP}:/var/www/html/wp-content/themes/${THEME_NAME}"
+
+rsync -az --delete \
+  --exclude='.git' \
+  --exclude='.github' \
+  --exclude='node_modules' \
+  -e "ssh -i \"$SSH_KEY\" -o StrictHostKeyChecking=no" \
+  --rsync-path="sudo rsync" \
+  ./ "${SSH_USER}@${PROD_VM_IP}:/var/www/html/wp-content/themes/${THEME_NAME}"
+'''
+                }
+            }
+        }
+
+        stage('Install WP-CLI on PROD & activate theme') {
+            steps {
+                withCredentials([
+                    sshUserPrivateKey(
+                        credentialsId: 'gcp-ssh-key',
+                        keyFileVariable: 'SSH_KEY',
+                        usernameVariable: 'SSH_USER'
+                    )
+                ]) {
+                    sh """#!/bin/bash
+set -e
+
+ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$SSH_USER@$PROD_VM_IP" bash -c '
+  set -e
+  cd /var/www/html
+
+  # Install WP-CLI if not present
+  if ! command -v wp >/dev/null 2>&1; then
+      echo "WP-CLI not found on PROD, installing..."
+      curl -sS -o /tmp/wp-cli.phar https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
+      php /tmp/wp-cli.phar --info >/dev/null 2>&1 || { echo "PHP not working for WP-CLI"; exit 1; }
+      sudo chmod +x /tmp/wp-cli.phar
+      sudo mv /tmp/wp-cli.phar /usr/local/bin/wp
+  fi
+
+  echo "WP-CLI version (PROD):"
+  wp --version
+
+  echo "Activating theme on PROD: ${THEME_NAME}"
+  wp theme activate "${THEME_NAME}" || true
+'
+"""
+                }
+            }
+        }
+    }
+}
