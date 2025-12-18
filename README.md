@@ -23,6 +23,9 @@ Instead, it links and coordinates multiple specialized repositories.
 ### Infrastructure provisioning (Pulumi)
 https://github.com/alper4283/pulumi_gcp
 
+After your configurations are complete, you can simply run:
+`pulumi up`
+
 Responsible for:
 - Creating Google Cloud resources
 - Networking and firewall configuration
@@ -30,6 +33,9 @@ Responsible for:
 
 ### Configuration management (Ansible)
 https://github.com/alper4283/gcp_wp_deployment
+
+After your configurations are complete, you can simply run:
+`ansible-playbook -i hosts.ini site.yml --ask-vault-pass --ask-become-pass`
 
 Responsible for:
 - Installing and configuring WordPress
